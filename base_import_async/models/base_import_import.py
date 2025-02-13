@@ -27,6 +27,8 @@ OPT_PRIORITY = "priority"
 
 INIT_PRIORITY = 100
 DEFAULT_CHUNK_SIZE = 100
+SPLIT_CHANNEL = "root.import_split_files"
+IMPORT_CHANNEL = "root.import_files"
 
 
 class BaseImportImport(models.TransientModel):
@@ -63,7 +65,7 @@ class BaseImportImport(models.TransientModel):
         attachment = self._create_csv_attachment(
             import_fields, data, options, file_name
         )
-        delayed_job = self.with_delay(description=description)._split_file(
+        delayed_job = self.with_delay(description=description, channel=IMPORT_CHANNEL)._split_file(
             model_name=self.res_model,
             translated_model_name=translated_model_name,
             attachment=attachment,
@@ -171,7 +173,7 @@ class BaseImportImport(models.TransientModel):
                 file_name=root + "-" + chunk + ext,
             )
             delayed_job = self.with_delay(
-                description=description, priority=priority
+                description=description, priority=priority, channel=SPLIT_CHANNEL
             )._import_one_chunk(
                 model_name=model_name, attachment=attachment, options=options
             )
