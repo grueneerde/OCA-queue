@@ -1,10 +1,14 @@
 # Copyright (c) 2015-2016 ACSONE SA/NV (<http://acsone.eu>)
 # Copyright 2015-2016 Camptocamp SA
 # License LGPL-3.0 or later (http://www.gnu.org/licenses/lgpl.html)
+import datetime
 import logging
+import re
 from functools import total_ordering
 from heapq import heappop, heappush
 from weakref import WeakValueDictionary
+
+import pytz
 
 from ..exception import ChannelNotFound
 from ..job import CANCELLED, DONE, ENQUEUED, FAILED, PENDING, STARTED, WAIT_DEPENDENCIES
@@ -334,6 +338,141 @@ class ChannelQueue(object):
         return wakeup_time
 
 
+_HOUR_RE = re.compile(r"^(\d{1,2})(?:[.h]?(\d{2}))?$")
+
+
+class RunWindows(object):
+    """Daily time windows during which a channel may start jobs.
+
+    Configured with ``hours=<start>-<end>[;<start>-<end>...]`` where times
+    are ``HH``, ``HHMM``, ``HH.MM`` or ``HHhMM`` (``:`` cannot be used as it
+    separates channel options). A window whose end is before its start spans
+    midnight. Times are interpreted in ``tz`` (default UTC). ``now`` values
+    are UTC seconds since the epoch, as used everywhere in the job runner.
+
+    >>> w = RunWindows('2200-0600', 'Europe/Vienna')
+    >>> def ts(s):
+    ...     dt = datetime.datetime.strptime(s, '%Y-%m-%d %H:%M')
+    ...     return (dt - datetime.datetime(1970, 1, 1)).total_seconds()
+    >>> def fmt(t):
+    ...     return datetime.datetime.utcfromtimestamp(t).strftime('%Y-%m-%d %H:%M')
+
+    Vienna is UTC+1 in winter: 20:59 UTC is 21:59 local, 21:00 UTC is 22:00.
+
+    >>> w.is_open(ts('2026-11-13 20:59'))
+    False
+    >>> w.is_open(ts('2026-11-13 21:00'))
+    True
+    >>> w.is_open(ts('2026-11-14 04:59'))
+    True
+    >>> w.is_open(ts('2026-11-14 05:00'))
+    False
+    >>> fmt(w.next_open(ts('2026-11-14 05:00')))
+    '2026-11-14 21:00'
+
+    In summer (UTC+2) the same local window starts at 20:00 UTC.
+
+    >>> fmt(w.next_open(ts('2026-07-01 12:00')))
+    '2026-07-01 20:00'
+
+    Several windows, open at the earliest following start:
+
+    >>> w = RunWindows('12-13;2230-0530')
+    >>> w.is_open(ts('2026-11-13 12:30')), w.is_open(ts('2026-11-13 13:00'))
+    (True, False)
+    >>> fmt(w.next_open(ts('2026-11-13 13:00')))
+    '2026-11-13 22:30'
+    >>> fmt(w.next_open(ts('2026-11-13 06:00')))
+    '2026-11-13 12:00'
+
+    Invalid specifications are rejected:
+
+    >>> RunWindows('22')  # what 'hours=22:00-06:00' becomes after parsing
+    Traceback (most recent call last):
+    ...
+    ValueError: Invalid hours '22': expected HHMM-HHMM[;HHMM-HHMM...] (no ':')
+    >>> RunWindows('2500-0600')
+    Traceback (most recent call last):
+    ...
+    ValueError: Invalid hours '2500-0600': invalid time '2500'
+    >>> RunWindows('0600-0600')
+    Traceback (most recent call last):
+    ...
+    ValueError: Invalid hours '0600-0600': empty window 0600-0600
+    >>> RunWindows('0600-1800', 'Mars/Olympus')
+    Traceback (most recent call last):
+    ...
+    ValueError: Invalid tz 'Mars/Olympus'
+    """
+
+    def __init__(self, spec, tz=None):
+        self.spec = spec
+        try:
+            self.tz = pytz.timezone(tz or "UTC")
+        except pytz.UnknownTimeZoneError as ex:
+            raise ValueError("Invalid tz %r" % tz) from ex
+        self.windows = []  # list of (start, end) in minutes since midnight
+        for part in split_strip(spec, ";"):
+            bounds = split_strip(part, "-")
+            if len(bounds) != 2 or not all(bounds):
+                raise ValueError(
+                    "Invalid hours %r: expected HHMM-HHMM[;HHMM-HHMM...] (no ':')" % spec
+                )
+            start, end = (self._parse_time(spec, b) for b in bounds)
+            if start == end:
+                raise ValueError("Invalid hours %r: empty window %s" % (spec, part))
+            self.windows.append((start, end))
+        if not self.windows:
+            raise ValueError("Invalid hours %r: no window" % spec)
+
+    @staticmethod
+    def _parse_time(spec, value):
+        match = _HOUR_RE.match(value)
+        if match:
+            hour, minute = int(match.group(1)), int(match.group(2) or 0)
+            if hour < 24 and minute < 60:
+                return hour * 60 + minute
+        if value == "24" or value == "2400":
+            return 0
+        raise ValueError("Invalid hours %r: invalid time %r" % (spec, value))
+
+    def __str__(self):
+        return "%s %s" % (self.spec, self.tz.zone)
+
+    def _local(self, now):
+        return pytz.utc.localize(datetime.datetime.utcfromtimestamp(now)).astimezone(
+            self.tz
+        )
+
+    def is_open(self, now):
+        local = self._local(now)
+        minute = local.hour * 60 + local.minute
+        for start, end in self.windows:
+            if start < end:
+                if start <= minute < end:
+                    return True
+            elif minute >= start or minute < end:
+                return True
+        return False
+
+    def next_open(self, now):
+        """Return the next window start after ``now`` (UTC epoch seconds)."""
+        today = self._local(now).date()
+        candidates = []
+        for days in (0, 1):
+            day = today + datetime.timedelta(days=days)
+            for start, _end in self.windows:
+                naive = datetime.datetime.combine(
+                    day, datetime.time(start // 60, start % 60)
+                )
+                local = self.tz.normalize(self.tz.localize(naive))
+                utc = local.astimezone(pytz.utc).replace(tzinfo=None)
+                ts = (utc - datetime.datetime(1970, 1, 1)).total_seconds()
+                if ts > now:
+                    candidates.append(ts)
+        return min(candidates)
+
+
 class Channel(object):
     """A channel for jobs, with a maximum capacity.
 
@@ -394,6 +533,7 @@ class Channel(object):
         self.capacity = capacity
         self.throttle = throttle  # seconds
         self.sequential = sequential
+        self.run_windows = None  # RunWindows, None means always open
 
     @property
     def sequential(self):
@@ -411,11 +551,18 @@ class Channel(object):
         * capacity
         * sequential
         * throttle
+        * hours (and tz), see :class:`RunWindows`
         """
         assert self.fullname.endswith(config["name"])
         self.capacity = config.get("capacity", None)
         self.sequential = bool(config.get("sequential", False))
         self.throttle = int(config.get("throttle", 0))
+        hours = config.get("hours")
+        if hours is True:
+            raise ValueError("Channel %s: hours requires a value" % config["name"])
+        if config.get("tz") and not hours:
+            raise ValueError("Channel %s: tz requires hours" % config["name"])
+        self.run_windows = RunWindows(hours, config.get("tz")) if hours else None
         if self.sequential and self.capacity != 1:
             raise ValueError("A sequential channel must have a capacity of 1")
 
@@ -432,13 +579,18 @@ class Channel(object):
 
     def __str__(self):
         capacity = "∞" if self.capacity is None else str(self.capacity)
-        return "%s(C:%s,Q:%d,R:%d,F:%d)" % (
+        return "%s(C:%s,Q:%d,R:%d,F:%d%s)" % (
             self.fullname,
             capacity,
             len(self._queue),
             len(self._running),
             len(self._failed),
+            ",H:%s" % self.run_windows if self.run_windows else "",
         )
+
+    def is_open(self, now):
+        """Whether the channel may start jobs at ``now`` (see ``hours``)."""
+        return not self.run_windows or self.run_windows.is_open(now)
 
     def remove(self, job):
         """Remove a job from the channel."""
@@ -513,11 +665,19 @@ class Channel(object):
         no job until at least throttle seconds have elapsed since the previous
         yield.
 
+        If the ``hours`` option is set on the channel, then outside of those
+        hours it yields no job and does not take jobs from its children
+        channels either, so they stay pending in their own channel without
+        using capacity. Jobs already running are not interrupted.
+
         :param now: the current datetime in seconds
 
         :return: iterator of
                  :class:`odoo.addons.queue_job.jobrunner.ChannelJob`
         """
+        if not self.is_open(now):
+            _logger.debug("channel %s closed (hours %s)", self, self.run_windows)
+            return
         # enqueue jobs of children channels
         for child in self.children.values():
             for job in child.get_jobs_to_run(now):
@@ -551,7 +711,15 @@ class Channel(object):
                 _logger.debug("pausing channel %s until %s", self, self._pause_until)
                 return
 
-    def get_wakeup_time(self, wakeup_time=0):
+    def get_wakeup_time(self, wakeup_time=0, now=None):
+        if self.run_windows:
+            if now is None:
+                now = _utc_now()
+            if not self.run_windows.is_open(now):
+                # closed, request wakeup when the next window opens; jobs of
+                # children would not run before that anyway
+                next_open = self.run_windows.next_open(now)
+                return min(wakeup_time, next_open) if wakeup_time else next_open
         if not self.has_capacity():
             # this channel is full, do not request timed wakeup, as
             # a notification will wakeup the runner when a job finishes
@@ -568,8 +736,13 @@ class Channel(object):
             return wakeup_time
         wakeup_time = self._queue.get_wakeup_time(wakeup_time)
         for child in self.children.values():
-            wakeup_time = child.get_wakeup_time(wakeup_time)
+            wakeup_time = child.get_wakeup_time(wakeup_time, now=now)
         return wakeup_time
+
+
+def _utc_now():
+    dt = datetime.datetime.utcnow()
+    return (dt - datetime.datetime(1970, 1, 1)).total_seconds()
 
 
 def split_strip(s, sep, maxsplit=-1):
@@ -702,6 +875,51 @@ class ChannelManager(object):
     >>> cm.notify(db, 'T', 'T2', 1, 0, 10, None, 'done')
     >>> cm.get_wakeup_time()
     107
+
+    Channels with ``hours`` only start jobs inside their time windows.
+    A window on a parent channel holds back its children too, and their
+    jobs stay pending in their own channel.
+
+    >>> import datetime
+    >>> def ts(s):
+    ...     dt = datetime.datetime.strptime(s, '%Y-%m-%d %H:%M')
+    ...     return (dt - datetime.datetime(1970, 1, 1)).total_seconds()
+    >>> cm = ChannelManager()
+    >>> cm.simple_configure('root:4,N:2:hours=2200-0600,N.sub:1')
+    >>> str(cm.get_channel_by_name('N'))
+    'root.N(C:2,Q:0,R:0,F:0,H:2200-0600 UTC)'
+    >>> cm.notify(db, 'N', 'N1', 1, 0, 10, None, 'pending')
+    >>> cm.notify(db, 'N.sub', 'N2', 2, 0, 10, None, 'pending')
+    >>> cm.notify(db, 'root', 'R1', 3, 0, 10, None, 'pending')
+    >>> pp(list(cm.get_jobs_to_run(now=ts('2026-11-13 12:00'))))
+    [<ChannelJob R1>]
+    >>> str(cm.get_channel_by_name('N.sub'))
+    'root.N.sub(C:1,Q:1,R:0,F:0)'
+    >>> cm.get_wakeup_time(now=ts('2026-11-13 12:00')) == ts('2026-11-13 22:00')
+    True
+    >>> pp(list(cm.get_jobs_to_run(now=ts('2026-11-13 22:00'))))
+    [<ChannelJob N1>, <ChannelJob N2>]
+
+    Running jobs are not interrupted when the window closes, but no new
+    job is started.
+
+    >>> cm.notify(db, 'N', 'N3', 4, 0, 10, None, 'pending')
+    >>> cm.notify(db, 'N', 'N1', 1, 0, 10, None, 'done')
+    >>> pp(list(cm.get_jobs_to_run(now=ts('2026-11-14 06:00'))))
+    []
+    >>> str(cm.get_channel_by_name('N'))
+    'root.N(C:2,Q:1,R:1,F:0,H:2200-0600 UTC)'
+
+    Invalid ``hours`` options are rejected at configuration time.
+
+    >>> cm.simple_configure('root:4,X:1:hours')
+    Traceback (most recent call last):
+    ...
+    ValueError: Channel X: hours requires a value
+    >>> cm.simple_configure('root:4,X:1:tz=Europe/Vienna')
+    Traceback (most recent call last):
+    ...
+    ValueError: Channel X: tz requires hours
 
     Test wakeup time behaviour in presence of eta.
 
@@ -1055,5 +1273,5 @@ class ChannelManager(object):
     def get_jobs_to_run(self, now):
         return self._root_channel.get_jobs_to_run(now)
 
-    def get_wakeup_time(self):
-        return self._root_channel.get_wakeup_time()
+    def get_wakeup_time(self, now=None):
+        return self._root_channel.get_wakeup_time(now=now)
