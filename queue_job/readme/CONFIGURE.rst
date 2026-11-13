@@ -24,6 +24,22 @@
   [queue_job]
   channels = root:2
 
+* Restrict a channel to working hours (optional) with the ``hours`` option,
+  and ``tz`` for the timezone of those hours (default UTC):
+
+  .. code-block:: ini
+
+    channels = root:4,root.night:1:hours=2200-0500:tz=Europe/Vienna
+
+  Times are written ``HH``, ``HHMM``, ``HH.MM`` or ``HHhMM`` (not ``HH:MM``,
+  ``:`` separates channel options); several windows are separated by ``;``
+  (``hours=1200-1300;2200-0500``) and a window ending before it starts spans
+  midnight. Outside its hours the channel starts no job, neither its own
+  nor those of its subchannels, which stay pending until the next window
+  opens. Running jobs are not interrupted when a window closes, so keep
+  some margin for long jobs. To restrict a single job function, route it to
+  such a channel via its *Job Function* (``queue.job.function``) channel.
+
 * Confirm the runner is starting correctly by checking the odoo log file:
 
 .. code-block::
